@@ -827,16 +827,45 @@ class TestPruneStaleStatePolling:
 
 
 class TestMaybeDiscoverTranscript:
-    async def test_skips_when_session_id_already_set(self) -> None:
+    async def test_noop_when_discovered_session_matches_current(self) -> None:
         from ccbot.handlers.status_polling import _maybe_discover_transcript
+        from ccbot.providers.base import SessionStartEvent
 
-        with patch("ccbot.handlers.status_polling.session_manager") as mock_sm:
+        mock_provider = MagicMock()
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.name = "codex"
+        mock_provider.discover_transcript.return_value = SessionStartEvent(
+            session_id="existing-id",
+            cwd="/proj",
+            transcript_path="/path/existing.jsonl",
+            window_key="ccbot:@7",
+        )
+
+        with (
+            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.status_polling.get_provider_for_window",
+                return_value=mock_provider,
+            ),
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+            patch("ccbot.handlers.status_polling.config") as mock_config,
+        ):
             mock_sm.window_states = {
-                "@7": MagicMock(session_id="existing-id", cwd="/proj")
+                "@7": MagicMock(
+                    session_id="existing-id",
+                    cwd="/proj",
+                    transcript_path="/path/existing.jsonl",
+                    provider_name="codex",
+                )
             }
+            mock_tmux.find_window_by_id = AsyncMock(
+                return_value=MagicMock(pane_current_command="bun")
+            )
+            mock_config.tmux_session_name = "ccbot"
             await _maybe_discover_transcript("@7")
-        # Should not call register
+
         mock_sm.register_hookless_session.assert_not_called()
+        mock_sm.write_hookless_session_map.assert_not_called()
 
     async def test_skips_when_no_cwd_and_no_tmux_window(self) -> None:
         from ccbot.handlers.status_polling import _maybe_discover_transcript
@@ -956,6 +985,52 @@ class TestMaybeDiscoverTranscript:
             session_id="uuid-abc",
             cwd="/my/project",
             transcript_path="/path/to/transcript.jsonl",
+            provider_name="codex",
+        )
+
+    async def test_updates_when_new_session_discovered_for_same_window(self) -> None:
+        from ccbot.handlers.status_polling import _maybe_discover_transcript
+        from ccbot.providers.base import SessionStartEvent
+
+        mock_provider = MagicMock()
+        mock_provider.capabilities.supports_hook = False
+        mock_provider.capabilities.name = "codex"
+        event = SessionStartEvent(
+            session_id="uuid-new",
+            cwd="/my/project",
+            transcript_path="/path/to/new.jsonl",
+            window_key="ccbot:@7",
+        )
+        mock_provider.discover_transcript.return_value = event
+
+        with (
+            patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
+            patch(
+                "ccbot.handlers.status_polling.get_provider_for_window",
+                return_value=mock_provider,
+            ),
+            patch("ccbot.handlers.status_polling.config") as mock_config,
+            patch("ccbot.handlers.status_polling.tmux_manager") as mock_tmux,
+        ):
+            mock_sm.window_states = {
+                "@7": MagicMock(
+                    session_id="uuid-old",
+                    cwd="/my/project",
+                    transcript_path="/path/to/old.jsonl",
+                    provider_name="codex",
+                )
+            }
+            mock_config.tmux_session_name = "ccbot"
+            mock_tmux.find_window_by_id = AsyncMock(
+                return_value=MagicMock(pane_current_command="bun")
+            )
+            await _maybe_discover_transcript("@7")
+
+        mock_sm.register_hookless_session.assert_called_once_with(
+            window_id="@7",
+            session_id="uuid-new",
+            cwd="/my/project",
+            transcript_path="/path/to/new.jsonl",
             provider_name="codex",
         )
 

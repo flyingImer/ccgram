@@ -40,7 +40,14 @@ from .message_sender import NO_LINK_PREVIEW, rate_limit_send
 logger = structlog.get_logger()
 
 # Tool names that trigger interactive UI via JSONL (terminal capture + inline keyboard)
-INTERACTIVE_TOOL_NAMES = frozenset({"AskUserQuestion", "ExitPlanMode"})
+INTERACTIVE_TOOL_NAMES = frozenset(
+    {
+        "AskUserQuestion",
+        "ExitPlanMode",
+        # Codex native tool name before normalization/fallback.
+        "request_user_input",
+    }
+)
 
 # Track interactive UI message IDs: (user_id, thread_id_or_0) -> message_id
 _interactive_msgs: dict[tuple[int, int], int] = {}

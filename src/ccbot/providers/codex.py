@@ -2,28 +2,31 @@
 
 Codex CLI uses a similar tmux-based launch model but differs in hook mechanism
 (no SessionStart hook) and resume syntax (``resume`` subcommand, not a flag).
-No interactive UI detection — terminal_ui_patterns is empty.
 
 Transcript format: JSONL with entries ``{timestamp, type, payload}``.
 Entry types: ``session_meta``, ``response_item``, ``input_item``, ``event_msg``,
-``turn_context``.  Roles in payload: ``developer``, ``user``, ``assistant``.
-Content blocks: ``input_text`` (user), ``output_text`` (assistant),
-``function_call`` / ``function_call_output`` (tool use).
+``turn_context``.
+
+Modern Codex ``response_item`` payloads use typed shapes:
+  - ``type=message`` with ``role`` + content blocks
+  - ``type=function_call`` with ``name``, ``arguments``, ``call_id``
+  - ``type=function_call_output`` with ``call_id``, ``output``
 """
 
 import json
 from pathlib import Path
 from typing import Any, cast
 
+from ccbot.providers._jsonl import JsonlProvider
 from ccbot.providers.base import (
     RESUME_ID_RE,
     AgentMessage,
-    ContentType,
     MessageRole,
     ProviderCapabilities,
     SessionStartEvent,
+    StatusUpdate,
 )
-from ccbot.providers._jsonl import JsonlProvider
+from ccbot.terminal_parser import UI_PATTERNS, extract_interactive_content
 
 # Codex CLI known slash commands
 # NOTE: /new excluded — collides with bot-native /new (create session)
@@ -38,37 +41,299 @@ _CODEX_BUILTINS: dict[str, str] = {
     "/mention": "Attach files to conversation",
 }
 
+_MAX_TOOL_SUMMARY = 200
+_TOOL_NAME_ALIASES: dict[str, str] = {
+    # Codex's question UI tool is equivalent to Claude's AskUserQuestion flow.
+    "request_user_input": "AskUserQuestion",
+}
 
-def _extract_codex_content(
-    content: Any, pending: dict[str, Any]
-) -> tuple[str, ContentType, dict[str, Any]]:
-    """Extract text and track tool use from Codex content blocks.
 
-    Codex uses ``output_text`` (assistant), ``input_text`` (user),
-    ``function_call`` and ``function_call_output`` (tool use).
-    """
+def _canonical_tool_name(name: str) -> str:
+    """Map provider-native tool names to ccbot canonical names."""
+    return _TOOL_NAME_ALIASES.get(name, name)
+
+
+def _extract_text_blocks(content: Any) -> str:
+    """Extract visible text from Codex message content."""
     if isinstance(content, str):
-        return content, "text", pending
+        return content
     if not isinstance(content, list):
-        return "", "text", pending
+        return ""
 
-    text = ""
-    content_type: ContentType = "text"
+    parts: list[str] = []
     for block in content:
         if not isinstance(block, dict):
             continue
-        btype = block.get("type", "")
-        if btype in ("output_text", "input_text"):
-            text += block.get("text", "")
-        elif btype == "function_call" and block.get("call_id"):
-            pending[block["call_id"]] = block.get("name", "unknown")
-            content_type = "tool_use"
-        elif btype == "function_call_output":
-            call_id = block.get("call_id")
-            if call_id:
-                pending.pop(call_id, None)
-            content_type = "tool_result"
-    return text, content_type, pending
+        if block.get("type") in ("output_text", "input_text"):
+            text = block.get("text")
+            if isinstance(text, str) and text:
+                parts.append(text)
+    return "".join(parts)
+
+
+def _parse_tool_arguments(arguments: Any) -> dict[str, Any]:
+    """Parse tool arguments from stringified JSON or dict."""
+    if isinstance(arguments, dict):
+        return arguments
+    if not isinstance(arguments, str) or not arguments:
+        return {}
+    try:
+        parsed = json.loads(arguments)
+    except json.JSONDecodeError:
+        return {}
+    return parsed if isinstance(parsed, dict) else {}
+
+
+def _first_nonempty_string(data: dict[str, Any]) -> str:
+    """Return first non-empty string value in a dict."""
+    for value in data.values():
+        if isinstance(value, str) and value:
+            return value
+    return ""
+
+
+def _summarize_exec_command(args: dict[str, Any]) -> str:
+    """Extract a concise command preview from exec_command/shell args."""
+    cmd = args.get("cmd")
+    if isinstance(cmd, str) and cmd:
+        return cmd
+
+    command = args.get("command")
+    if isinstance(command, list):
+        joined = " ".join(part for part in command if isinstance(part, str))
+        if joined:
+            return joined
+    if isinstance(command, str) and command:
+        return command
+    return ""
+
+
+def _format_tool_use_text(raw_tool_name: str, args: dict[str, Any]) -> str:
+    """Build display text for a Codex tool_use item."""
+    tool_name = _canonical_tool_name(raw_tool_name)
+    summary = _summarize_tool_use(raw_tool_name, tool_name, args)
+
+    if summary:
+        if len(summary) > _MAX_TOOL_SUMMARY:
+            summary = summary[:_MAX_TOOL_SUMMARY] + "..."
+        return f"**{tool_name}** `{summary}`"
+    return f"**{tool_name}**"
+
+
+def _summarize_tool_use(
+    raw_tool_name: str,
+    tool_name: str,
+    args: dict[str, Any],
+) -> str:
+    """Create a short tool-use summary string."""
+    if tool_name == "AskUserQuestion":
+        return _summarize_question(args)
+    if raw_tool_name in ("exec_command", "shell"):
+        return _summarize_exec_command(args)
+    if raw_tool_name == "write_stdin":
+        chars = args.get("chars")
+        return chars if isinstance(chars, str) else ""
+    if raw_tool_name == "update_plan":
+        plan = args.get("plan")
+        if isinstance(plan, list):
+            return f"{len(plan)} step(s)"
+        return ""
+    return _first_nonempty_string(args)
+
+
+def _summarize_question(args: dict[str, Any]) -> str:
+    """Extract the first question prompt for request_user_input."""
+    questions = args.get("questions")
+    if not (isinstance(questions, list) and questions):
+        return ""
+    first = questions[0]
+    if not isinstance(first, dict):
+        return ""
+    question = first.get("question")
+    return question if isinstance(question, str) else ""
+
+
+def _extract_tool_output_text(output: Any) -> str:
+    """Extract the useful output section from Codex function_call_output."""
+    if isinstance(output, str):
+        marker = "\nOutput:\n"
+        if marker in output:
+            return output.split(marker, 1)[1].strip()
+        return output.strip()
+    if isinstance(output, dict):
+        return json.dumps(output, ensure_ascii=False)
+    return ""
+
+
+def _format_request_user_input_result(output_text: str) -> str:
+    """Summarize request_user_input answers."""
+    if not output_text:
+        return output_text
+    try:
+        parsed = json.loads(output_text)
+    except json.JSONDecodeError:
+        return output_text
+    if not isinstance(parsed, dict):
+        return output_text
+
+    answers = parsed.get("answers")
+    if not isinstance(answers, dict):
+        return output_text
+
+    selected: list[str] = []
+    for answer in answers.values():
+        if not isinstance(answer, dict):
+            continue
+        items = answer.get("answers")
+        if isinstance(items, list):
+            selected.extend(item for item in items if isinstance(item, str) and item)
+
+    if selected:
+        return "Selected: " + ", ".join(selected)
+    return output_text
+
+
+def _parse_codex_response_item(
+    payload: dict[str, Any],
+    pending: dict[str, Any],
+) -> tuple[list[AgentMessage], dict[str, Any]]:
+    """Parse a Codex response_item payload."""
+    payload_type = payload.get("type", "")
+    if payload_type == "function_call":
+        return _parse_function_call(payload, pending)
+    if payload_type == "function_call_output":
+        return _parse_function_call_output(payload, pending)
+    return _parse_response_message(payload, pending)
+
+
+def _parse_function_call(
+    payload: dict[str, Any],
+    pending: dict[str, Any],
+) -> tuple[list[AgentMessage], dict[str, Any]]:
+    """Parse a function_call payload into a tool_use AgentMessage."""
+    raw_name_value = payload.get("name", "unknown")
+    raw_name = (
+        raw_name_value if isinstance(raw_name_value, str) else str(raw_name_value)
+    )
+    tool_name = _canonical_tool_name(raw_name)
+    call_id = payload.get("call_id", "")
+    if isinstance(call_id, str) and call_id:
+        pending[call_id] = tool_name
+    args = _parse_tool_arguments(payload.get("arguments", {}))
+    return (
+        [
+            AgentMessage(
+                text=_format_tool_use_text(raw_name, args),
+                role="assistant",
+                content_type="tool_use",
+                tool_use_id=call_id or None,
+                tool_name=tool_name,
+            )
+        ],
+        pending,
+    )
+
+
+def _parse_function_call_output(
+    payload: dict[str, Any],
+    pending: dict[str, Any],
+) -> tuple[list[AgentMessage], dict[str, Any]]:
+    """Parse a function_call_output payload into a tool_result AgentMessage."""
+    call_id = payload.get("call_id", "")
+    resolved_name = (
+        pending.pop(call_id, None) if isinstance(call_id, str) and call_id else None
+    )
+    tool_name = (
+        resolved_name if isinstance(resolved_name, str) and resolved_name else None
+    )
+
+    output_text = _extract_tool_output_text(payload.get("output", ""))
+    if tool_name == "AskUserQuestion":
+        output_text = _format_request_user_input_result(output_text)
+    if not output_text:
+        output_text = "Done"
+
+    return (
+        [
+            AgentMessage(
+                text=output_text,
+                role="assistant",
+                content_type="tool_result",
+                tool_use_id=call_id if isinstance(call_id, str) else None,
+                tool_name=tool_name,
+            )
+        ],
+        pending,
+    )
+
+
+def _parse_response_message(
+    payload: dict[str, Any],
+    pending: dict[str, Any],
+) -> tuple[list[AgentMessage], dict[str, Any]]:
+    """Parse message payloads (assistant/user text)."""
+    role = payload.get("role", "")
+    if role not in ("user", "assistant"):
+        return [], pending
+    text = _extract_text_blocks(payload.get("content", ""))
+    if not text:
+        return [], pending
+    return (
+        [
+            AgentMessage(
+                text=text,
+                role=cast(MessageRole, role),
+                content_type="text",
+            )
+        ],
+        pending,
+    )
+
+
+def _parse_event_message(
+    payload: dict[str, Any],
+    pending: dict[str, Any],
+) -> tuple[list[AgentMessage], dict[str, Any]]:
+    """Parse Codex event_msg payloads that carry assistant-visible text."""
+    payload_type = payload.get("type", "")
+    if payload_type != "agent_message":
+        return [], pending
+    text = payload.get("message", "")
+    if not isinstance(text, str) or not text:
+        return [], pending
+    return (
+        [AgentMessage(text=text, role="assistant", content_type="text")],
+        pending,
+    )
+
+
+def _parse_input_item(
+    payload: dict[str, Any],
+    pending: dict[str, Any],
+) -> tuple[list[AgentMessage], dict[str, Any]]:
+    """Parse Codex input_item payloads."""
+    if payload.get("role", "") != "user":
+        return [], pending
+    content = payload.get("content", "")
+    if not isinstance(content, str) or not content:
+        return [], pending
+    return ([AgentMessage(text=content, role="user", content_type="text")], pending)
+
+
+def _append_unique_messages(
+    dest: list[AgentMessage],
+    candidates: list[AgentMessage],
+    last_signature: tuple[str, str, str] | None,
+) -> tuple[str, str, str] | None:
+    """Append messages while dropping exact adjacent duplicates."""
+    current = last_signature
+    for message in candidates:
+        signature = (message.role, message.content_type, message.text)
+        if signature == current:
+            continue
+        dest.append(message)
+        current = signature
+    return current
 
 
 # Transcripts older than this are considered stale and skipped during discovery.
@@ -118,7 +383,7 @@ class CodexProvider(JsonlProvider):
         supports_continue=True,
         supports_structured_transcript=True,
         transcript_format="jsonl",
-        terminal_ui_patterns=(),
+        terminal_ui_patterns=tuple(p.name for p in UI_PATTERNS),
         builtin_commands=tuple(_CODEX_BUILTINS.keys()),
     )
 
@@ -147,9 +412,8 @@ class CodexProvider(JsonlProvider):
     def parse_transcript_line(self, line: str) -> dict[str, Any] | None:
         """Parse a Codex JSONL line.
 
-        Codex entries are ``{timestamp, type, payload}``.  We normalize to
-        a flat dict with ``type`` set to a role-like value for downstream
-        compatibility, and ``_codex_type`` preserving the original type.
+        Codex entries are stored as JSON objects:
+        ``{timestamp, type, payload}``.
         """
         if not line or not line.strip():
             return None
@@ -164,42 +428,36 @@ class CodexProvider(JsonlProvider):
         entries: list[dict[str, Any]],
         pending_tools: dict[str, Any],
     ) -> tuple[list[AgentMessage], dict[str, Any]]:
-        """Parse Codex JSONL entries into AgentMessages.
-
-        Maps ``response_item`` with ``role=assistant`` to assistant messages
-        and ``role=user`` (non-system) to user messages.  Skips developer
-        (system prompt) and event_msg entries.
-        """
+        """Parse Codex JSONL entries into AgentMessages."""
         messages: list[AgentMessage] = []
         pending = dict(pending_tools)
+        last_signature: tuple[str, str, str] | None = None
 
         for entry in entries:
             entry_type = entry.get("type", "")
             payload = entry.get("payload", {})
+            if not isinstance(payload, dict):
+                continue
 
             if entry_type == "response_item":
-                role = payload.get("role", "")
-                if role not in ("user", "assistant"):
-                    continue
-                content = payload.get("content", "")
-                text, content_type, pending = _extract_codex_content(content, pending)
-                if text:
-                    messages.append(
-                        AgentMessage(
-                            text=text,
-                            role=cast(MessageRole, role),
-                            content_type=content_type,
-                        )
-                    )
-            elif entry_type == "input_item":
-                role = payload.get("role", "")
-                if role != "user":
-                    continue
-                content = payload.get("content", "")
-                if isinstance(content, str) and content:
-                    messages.append(
-                        AgentMessage(text=content, role="user", content_type="text")
-                    )
+                parsed, pending = _parse_codex_response_item(payload, pending)
+                last_signature = _append_unique_messages(
+                    messages, parsed, last_signature
+                )
+                continue
+
+            if entry_type == "event_msg":
+                parsed, pending = _parse_event_message(payload, pending)
+                last_signature = _append_unique_messages(
+                    messages, parsed, last_signature
+                )
+                continue
+
+            if entry_type == "input_item":
+                parsed, pending = _parse_input_item(payload, pending)
+                last_signature = _append_unique_messages(
+                    messages, parsed, last_signature
+                )
 
         return messages, pending
 
@@ -207,6 +465,8 @@ class CodexProvider(JsonlProvider):
         """Check if this Codex entry is a human turn."""
         entry_type = entry.get("type", "")
         payload = entry.get("payload", {})
+        if not isinstance(payload, dict):
+            return False
         if entry_type == "response_item" and payload.get("role") == "user":
             # Skip system/developer messages that look like user
             content = payload.get("content", [])
@@ -223,13 +483,15 @@ class CodexProvider(JsonlProvider):
         """Parse a single Codex transcript entry for history display."""
         entry_type = entry.get("type", "")
         payload = entry.get("payload", {})
+        if not isinstance(payload, dict):
+            return None
 
         if entry_type == "response_item":
             role = payload.get("role", "")
             if role not in ("user", "assistant"):
                 return None
             content = payload.get("content", "")
-            text, _, _ = _extract_codex_content(content, {})
+            text = _extract_text_blocks(content)
             if not text:
                 return None
             return AgentMessage(
@@ -244,6 +506,23 @@ class CodexProvider(JsonlProvider):
                 return None
             return AgentMessage(text=text, role="user", content_type="text")
 
+        return None
+
+    def parse_terminal_status(
+        self,
+        pane_text: str,
+        *,
+        pane_title: str = "",  # noqa: ARG002
+    ) -> StatusUpdate | None:
+        """Parse Codex pane content for interactive prompts."""
+        interactive = extract_interactive_content(pane_text)
+        if interactive:
+            return StatusUpdate(
+                raw_text=interactive.content,
+                display_label=interactive.name,
+                is_interactive=True,
+                ui_type=interactive.name,
+            )
         return None
 
     def discover_transcript(

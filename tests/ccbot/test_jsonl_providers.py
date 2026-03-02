@@ -59,9 +59,10 @@ class TestCodexLaunchArgs:
 
 
 class TestCodexCapabilities:
-    def test_no_terminal_ui_patterns(self) -> None:
+    def test_declares_interactive_patterns(self) -> None:
         codex = CodexProvider()
-        assert codex.capabilities.terminal_ui_patterns == ()
+        assert "SelectionUI" in codex.capabilities.terminal_ui_patterns
+        assert "PermissionPrompt" in codex.capabilities.terminal_ui_patterns
 
 
 # ── Gemini-specific ──────────────────────────────────────────────────────
@@ -100,6 +101,7 @@ class TestCodexTranscriptParsing:
             {
                 "type": "response_item",
                 "payload": {
+                    "type": "message",
                     "role": "assistant",
                     "content": [{"type": "output_text", "text": "hello"}],
                 },
@@ -123,20 +125,64 @@ class TestCodexTranscriptParsing:
         assert messages[0].text == "what is this?"
         assert messages[0].role == "user"
 
+    def test_parses_event_agent_message(self) -> None:
+        codex = CodexProvider()
+        entries = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "working on it",
+                },
+            }
+        ]
+        messages, _ = codex.parse_transcript_entries(entries, {})
+        assert len(messages) == 1
+        assert messages[0].text == "working on it"
+        assert messages[0].role == "assistant"
+        assert messages[0].content_type == "text"
+
+    def test_dedupes_identical_event_and_response_messages(self) -> None:
+        codex = CodexProvider()
+        entries = [
+            {
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "same text",
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": "same text"}],
+                },
+            },
+        ]
+        messages, _ = codex.parse_transcript_entries(entries, {})
+        assert len(messages) == 1
+        assert messages[0].text == "same text"
+
     def test_tracks_function_call_pending(self) -> None:
         codex = CodexProvider()
         entries = [
             {
                 "type": "response_item",
                 "payload": {
-                    "role": "assistant",
-                    "content": [
-                        {"type": "function_call", "call_id": "fc1", "name": "bash"}
-                    ],
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "fc1",
+                    "arguments": '{"cmd":"ls"}',
                 },
             }
         ]
-        _, pending = codex.parse_transcript_entries(entries, {})
+        messages, pending = codex.parse_transcript_entries(entries, {})
+        assert len(messages) == 1
+        assert messages[0].content_type == "tool_use"
+        assert messages[0].tool_use_id == "fc1"
+        assert messages[0].tool_name == "exec_command"
         assert "fc1" in pending
 
     def test_function_call_output_clears_pending(self) -> None:
@@ -145,19 +191,53 @@ class TestCodexTranscriptParsing:
             {
                 "type": "response_item",
                 "payload": {
-                    "role": "assistant",
-                    "content": [
-                        {
-                            "type": "function_call_output",
-                            "call_id": "fc1",
-                            "output": "ok",
-                        }
-                    ],
+                    "type": "function_call_output",
+                    "call_id": "fc1",
+                    "output": "Chunk ID: abc\nOutput:\nok\n",
                 },
             }
         ]
-        _, pending = codex.parse_transcript_entries(entries, {"fc1": "bash"})
+        messages, pending = codex.parse_transcript_entries(
+            entries, {"fc1": "exec_command"}
+        )
+        assert len(messages) == 1
+        assert messages[0].content_type == "tool_result"
+        assert messages[0].tool_use_id == "fc1"
+        assert messages[0].text == "ok"
         assert "fc1" not in pending
+
+    def test_request_user_input_maps_to_ask_user_question(self) -> None:
+        codex = CodexProvider()
+        entries = [
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "request_user_input",
+                    "call_id": "q1",
+                    "arguments": (
+                        '{"questions":[{"question":"Pick one?",'
+                        '"options":[{"label":"A"},{"label":"B"}]}]}'
+                    ),
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "q1",
+                    "output": '{"answers":{"q":{"answers":["A"]}}}',
+                },
+            },
+        ]
+        messages, pending = codex.parse_transcript_entries(entries, {})
+        assert pending == {}
+        assert len(messages) == 2
+        assert messages[0].content_type == "tool_use"
+        assert messages[0].tool_name == "AskUserQuestion"
+        assert "Pick one?" in messages[0].text
+        assert messages[1].content_type == "tool_result"
+        assert messages[1].text == "Selected: A"
 
     def test_skips_developer_role(self) -> None:
         codex = CodexProvider()
@@ -191,6 +271,26 @@ class TestCodexTranscriptParsing:
             },
         }
         assert codex.is_user_transcript_entry(entry) is False
+
+
+class TestCodexTerminalStatus:
+    def test_detects_selection_ui(self) -> None:
+        codex = CodexProvider()
+        pane = (
+            "  Which option should I use?\n"
+            "  › Option A\n"
+            "    Option B\n"
+            "  Press enter to confirm\n"
+        )
+        status = codex.parse_terminal_status(pane)
+        assert status is not None
+        assert status.is_interactive is True
+        assert status.ui_type == "SelectionUI"
+
+    def test_returns_none_for_non_interactive(self) -> None:
+        codex = CodexProvider()
+        status = codex.parse_terminal_status("normal output\n")
+        assert status is None
 
 
 # ── Gemini transcript parsing ───────────────────────────────────────────

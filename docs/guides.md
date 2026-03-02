@@ -22,6 +22,39 @@ ccbot --version              # Show version
 ccbot -v                     # Run with debug logging
 ```
 
+## Local Dev in tmux
+
+Recommended local development model:
+
+- Run ccbot in a dedicated control window `ccbot:__main__`.
+- Keep agent windows in the same `ccbot` tmux session.
+- Restart by sending Ctrl-C to the control pane.
+
+Use the helper script:
+
+```bash
+./scripts/restart.sh start      # fresh start; creates ccbot:__main__ if missing
+./scripts/restart.sh status     # show current command + last logs
+./scripts/restart.sh restart    # sends Ctrl-C to control pane (supervisor restarts)
+./scripts/restart.sh stop       # sends Ctrl-\ to control pane (supervisor exits)
+```
+
+Direct key behavior in the control pane (`ccbot:__main__`):
+
+- `Ctrl-C`: restart ccbot.
+- `Ctrl-\`: stop the local dev supervisor loop.
+
+### Fresh Start Guide
+
+If you are starting from scratch:
+
+1. `cd /path/to/ccbot`
+2. `./scripts/restart.sh start`
+3. `tmux attach -t ccbot`
+4. In another terminal (or another pane), open your agent windows in the same tmux session.
+
+The `start` command creates the tmux session/window if they do not exist, so no manual tmux bootstrap is required.
+
 ## Configuration
 
 All settings accept both CLI flags and environment variables. CLI flags take precedence. `TELEGRAM_BOT_TOKEN` is env-only for security (flags are visible in `ps`).
@@ -133,7 +166,7 @@ CCBot supports multiple agent CLI backends. Each Telegram topic can use a differ
 | Provider    | CLI Command | Hook Events         | Status Detection                   |
 | ----------- | ----------- | ------------------- | ---------------------------------- |
 | Claude Code | `claude`    | Yes (7 event types) | Hook events + pyte VT100 + spinner |
-| Codex CLI   | `codex`     | No                  | Transcript activity heuristic      |
+| Codex CLI   | `codex`     | No                  | pyte VT100 interactive UI + transcript activity heuristic |
 | Gemini CLI  | `gemini`    | No                  | Pane title + interactive UI        |
 
 ### Choosing a Provider
@@ -148,7 +181,7 @@ CCBot supports multiple agent CLI backends. Each Telegram topic can use a differ
 
 **Claude Code** has the richest integration — 7 hook event types (SessionStart, Notification, Stop, SubagentStart, SubagentStop, TeammateIdle, TaskCompleted) provide instant session tracking, interactive UI detection, done/idle detection, subagent activity monitoring, and agent team notifications. The bot also uses a pyte VT100 screen buffer as fallback for terminal status parsing. Multi-pane windows (e.g. from agent teams) are automatically scanned for blocked panes and surfaced as inline keyboard alerts.
 
-**Codex CLI** and **Gemini CLI** lack a session hook, so session tracking relies on auto-detection from running processes. Codex has no terminal UI for permission prompts. Gemini sets pane titles (`Working: ✦`, `Action Required: ✋`, `Ready: ◇`) that CCBot reads for status, and its `@inquirer/select` permission prompts are detected as interactive UI.
+**Codex CLI** and **Gemini CLI** lack a session hook, so session tracking relies on auto-detection from running processes. Codex interactive prompts (question lists, permission prompts, and other selection UIs) are detected from terminal screen content via pyte and shown with inline keyboard controls. Gemini sets pane titles (`Working: ✦`, `Action Required: ✋`, `Ready: ◇`) that CCBot reads for status, and its `@inquirer/select` permission prompts are detected as interactive UI.
 
 ### Custom Launch Commands
 

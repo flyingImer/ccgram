@@ -836,9 +836,10 @@ async def _probe_topic_existence(bot: Bot) -> None:
 async def _maybe_discover_transcript(window_id: str) -> None:
     """Discover and register transcript for hookless providers (Codex, Gemini).
 
-    Runs once per window: skips if the window already has a session_id.
-    When a transcript is found, writes a synthetic session_map entry so the
-    session monitor starts tracking it.
+    Runs on each poll cycle for bound windows. For hookless providers, this
+    allows transcript re-discovery when a new CLI session starts in the same
+    tmux window. When a transcript is found, writes/updates a synthetic
+    session_map entry so the session monitor tracks the current session.
 
     Provider resolution logic:
     - If ``state.provider_name`` is explicitly set AND provider has hooks,
@@ -853,7 +854,7 @@ async def _maybe_discover_transcript(window_id: str) -> None:
     from ..providers import registry
 
     state = session_manager.window_states.get(window_id)
-    if not state or state.session_id:
+    if not state:
         return
 
     # If provider is explicitly set and supports hooks, trust hook delivery
@@ -904,6 +905,12 @@ async def _maybe_discover_transcript(window_id: str) -> None:
                 provider.discover_transcript, state.cwd, window_key
             )
         if event:
+            if (
+                state.session_id == event.session_id
+                and state.transcript_path == event.transcript_path
+                and state.provider_name == provider_name
+            ):
+                return
             session_manager.register_hookless_session(
                 window_id=window_id,
                 session_id=event.session_id,

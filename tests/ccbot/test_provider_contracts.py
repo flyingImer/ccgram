@@ -181,6 +181,7 @@ def _make_assistant_entry(
         return {
             "type": "response_item",
             "payload": {
+                "type": "message",
                 "role": "assistant",
                 "content": [{"type": "output_text", "text": text}],
             },
@@ -201,8 +202,10 @@ def _make_tool_use_entry(provider: AgentProvider) -> dict[str, Any]:
         return {
             "type": "response_item",
             "payload": {
-                "role": "assistant",
-                "content": [{"type": "function_call", "call_id": "t1", "name": "Read"}],
+                "type": "function_call",
+                "name": "exec_command",
+                "arguments": '{"cmd":"ls"}',
+                "call_id": "t1",
             },
         }
     if name == "gemini":
@@ -226,10 +229,9 @@ def _make_tool_result_entry(provider: AgentProvider) -> dict[str, Any]:
         return {
             "type": "response_item",
             "payload": {
-                "role": "assistant",
-                "content": [
-                    {"type": "function_call_output", "call_id": "t1", "output": "ok"}
-                ],
+                "type": "function_call_output",
+                "call_id": "t1",
+                "output": "Chunk ID: 1\nOutput:\nok\n",
             },
         }
     if name == "gemini":

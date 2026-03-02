@@ -1,87 +1,143 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-TMUX_SESSION="ccbot"
-TMUX_WINDOW="__main__"
-TARGET="${TMUX_SESSION}:${TMUX_WINDOW}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-MAX_WAIT=10 # seconds to wait for process to exit
+TMUX_SESSION="${CCBOT_DEV_TMUX_SESSION:-ccbot}"
+TMUX_WINDOW="${CCBOT_DEV_TMUX_WINDOW:-__main__}"
+TARGET="${TMUX_SESSION}:${TMUX_WINDOW}"
+LOCK_DIR="${PROJECT_DIR}/.ccbot-dev-run.lock.d"
 
-# Ensure tmux session and window exist (create if missing)
-if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-	echo "Creating tmux session '$TMUX_SESSION'..."
-	tmux new-session -d -s "$TMUX_SESSION" -n "$TMUX_WINDOW"
-elif ! tmux list-windows -t "$TMUX_SESSION" -F '#{window_name}' 2>/dev/null | grep -qx "$TMUX_WINDOW"; then
-	echo "Creating window '$TMUX_WINDOW' in session '$TMUX_SESSION'..."
-	tmux new-window -t "$TMUX_SESSION" -n "$TMUX_WINDOW"
-fi
-
-# Get the pane PID and check if uv run ccbot is running
-PANE_PID=$(tmux list-panes -t "$TARGET" -F '#{pane_pid}')
-
-is_ccbot_running() {
-	# Use tmux pane_current_command (works on macOS and Linux,
-	# unlike pstree -a which is Linux-only)
-	local pane_cmd
-	pane_cmd=$(tmux list-panes -t "$TARGET" -F '#{pane_current_command}' 2>/dev/null)
-	case "$pane_cmd" in
-	uv | python | python3 | python3.* | ccbot) return 0 ;;
-	*) return 1 ;;
-	esac
+usage() {
+	echo "Usage: $0 {start|stop|restart|status}"
+	echo "  start   start local dev supervisor in ${TARGET}"
+	echo "  stop    stop supervisor loop (Ctrl-\\ in control pane)"
+	echo "  restart restart ccbot process (Ctrl-C in control pane)"
+	echo "  status  show target pane command and recent logs"
 }
 
-# Stop existing process if running
-if is_ccbot_running; then
-	echo "Found running ccbot process, sending Ctrl-C..."
-	tmux send-keys -t "$TARGET" C-c
-
-	# Wait for process to exit
-	waited=0
-	while is_ccbot_running && [ "$waited" -lt "$MAX_WAIT" ]; do
-		sleep 1
-		waited=$((waited + 1))
-		echo "  Waiting for process to exit... (${waited}s/${MAX_WAIT}s)"
-	done
-
-	if is_ccbot_running; then
-		echo "Process did not exit after ${MAX_WAIT}s, sending SIGTERM..."
-		# Kill child processes of the pane shell (works on macOS and Linux)
-		for child_pid in $(pgrep -P "$PANE_PID" 2>/dev/null); do
-			kill "$child_pid" 2>/dev/null || true
-		done
-		sleep 2
-		if is_ccbot_running; then
-			echo "Process still running, sending SIGKILL..."
-			for child_pid in $(pgrep -P "$PANE_PID" 2>/dev/null); do
-				kill -9 "$child_pid" 2>/dev/null || true
-			done
-			sleep 1
+runloop() {
+	cd "${PROJECT_DIR}"
+	acquire_lock() {
+		if mkdir "${LOCK_DIR}" 2>/dev/null; then
+			echo "$$" >"${LOCK_DIR}/pid"
+			trap 'rm -rf "${LOCK_DIR}"' EXIT INT TERM
+			return
 		fi
+		local pid=""
+		if [[ -f "${LOCK_DIR}/pid" ]]; then
+			pid="$(cat "${LOCK_DIR}/pid" 2>/dev/null || true)"
+		fi
+		if [[ -n "${pid}" ]] && kill -0 "${pid}" 2>/dev/null; then
+			echo "[ccbot-dev] supervisor already running (pid ${pid})"
+			exit 1
+		fi
+		rm -rf "${LOCK_DIR}" 2>/dev/null || true
+		if mkdir "${LOCK_DIR}" 2>/dev/null; then
+			echo "$$" >"${LOCK_DIR}/pid"
+			trap 'rm -rf "${LOCK_DIR}"' EXIT INT TERM
+			return
+		fi
+		echo "[ccbot-dev] failed to acquire lock at ${LOCK_DIR}"
+		exit 1
+	}
+
+	acquire_lock
+	ulimit -c 0
+	echo "[ccbot-dev] started in ${TARGET}"
+	echo "[ccbot-dev] hint: Ctrl-C restarts ccbot"
+	echo "[ccbot-dev] hint: Ctrl-\\ stops supervisor loop"
+	while true; do
+		echo "[ccbot-dev] starting uv run ccbot ($(date '+%H:%M:%S'))"
+		set +e
+		uv run ccbot
+		code=$?
+		set -e
+		case "${code}" in
+		130)
+			echo "[ccbot-dev] restart requested"
+			sleep 1
+			;;
+		131)
+			echo "[ccbot-dev] stop requested"
+			exit 0
+			;;
+		0)
+			echo "[ccbot-dev] exited cleanly; restarting in 1s"
+			sleep 1
+			;;
+		*)
+			echo "[ccbot-dev] exited code ${code}; restarting in 1s"
+			sleep 1
+			;;
+		esac
+	done
+}
+
+ensure_target() {
+	if ! tmux has-session -t "${TMUX_SESSION}" 2>/dev/null; then
+		echo "Creating tmux session '${TMUX_SESSION}' with window '${TMUX_WINDOW}'..."
+		tmux new-session -d -s "${TMUX_SESSION}" -n "${TMUX_WINDOW}" -c "${PROJECT_DIR}"
+		return
+	fi
+	if ! tmux list-windows -t "${TMUX_SESSION}" -F '#{window_name}' | grep -qx "${TMUX_WINDOW}"; then
+		echo "Creating window '${TMUX_WINDOW}' in session '${TMUX_SESSION}'..."
+		tmux new-window -t "${TMUX_SESSION}" -n "${TMUX_WINDOW}" -c "${PROJECT_DIR}"
+	fi
+}
+
+pane_command() {
+	tmux list-panes -t "${TARGET}" -F '#{pane_current_command}' 2>/dev/null | head -n 1
+}
+
+status() {
+	ensure_target
+	local cmd
+	cmd="$(pane_command || true)"
+	echo "Target: ${TARGET}"
+	echo "Current command: ${cmd:-unknown}"
+	echo "Recent output:"
+	echo "----------------------------------------"
+	tmux capture-pane -t "${TARGET}" -p | tail -20
+	echo "----------------------------------------"
+}
+
+start() {
+	ensure_target
+	local cmd
+	cmd="$(pane_command || true)"
+	if [[ -n "${cmd}" && "${cmd}" != "zsh" && "${cmd}" != "bash" && "${cmd}" != "sh" && "${cmd}" != "fish" ]]; then
+		echo "Target pane ${TARGET} is busy (current command: ${cmd})."
+		echo "Use '$0 stop' or clear the pane before starting."
+		exit 1
 	fi
 
-	echo "Process stopped."
-else
-	echo "No ccbot process running in $TARGET"
-fi
+	echo "Starting local dev supervisor in ${TARGET}..."
+	tmux send-keys -t "${TARGET}" "bash '${PROJECT_DIR}/scripts/restart.sh' __runloop" Enter
+	sleep 1
+	status
+}
 
-# Brief pause to let the shell settle
-sleep 1
+stop() {
+	ensure_target
+	echo "Stopping supervisor in ${TARGET} (Ctrl-\\)..."
+	tmux send-keys -t "${TARGET}" C-\\
+	sleep 1
+	status
+}
 
-# Start ccbot
-echo "Starting ccbot in $TARGET..."
-tmux send-keys -t "$TARGET" "cd ${PROJECT_DIR} && uv run ccbot" Enter
+restart() {
+	ensure_target
+	echo "Restarting ccbot in ${TARGET} (Ctrl-C)..."
+	tmux send-keys -t "${TARGET}" C-c
+	sleep 1
+	status
+}
 
-# Verify startup and show logs
-sleep 3
-if is_ccbot_running; then
-	echo "ccbot restarted successfully. Recent logs:"
-	echo "----------------------------------------"
-	tmux capture-pane -t "$TARGET" -p | tail -20
-	echo "----------------------------------------"
-else
-	echo "Warning: ccbot may not have started. Pane output:"
-	echo "----------------------------------------"
-	tmux capture-pane -t "$TARGET" -p | tail -30
-	echo "----------------------------------------"
-	exit 1
-fi
+case "${1:-}" in
+__runloop) runloop ;;
+start) start ;;
+stop) stop ;;
+restart) restart ;;
+status) status ;;
+*) usage; exit 2 ;;
+esac

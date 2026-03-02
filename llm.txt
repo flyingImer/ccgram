@@ -1,0 +1,51 @@
+LLM Context Manifest for ccbot
+
+Purpose:
+- Provide architecture and design context for AI agents before code changes.
+
+Read this order:
+1. docs/ai-agents/README.md
+2. docs/ai-agents/architecture-map.md
+3. docs/ai-agents/codebase-index.md
+4. docs/ai-agents/tooling-and-tests.md
+5. docs/ai-agents/extension-and-fix-playbook.md
+
+Core architecture invariants:
+- Topic-centric model: one Telegram topic maps to one tmux window.
+- Internal identity is tmux window_id (for example @2), not window names.
+- Per-window provider model: behavior/capabilities are resolved by window provider.
+- Parsing keeps full content; message splitting happens only in Telegram send layer.
+- tmux operations remain centralized in src/ccbot/tmux_manager.py.
+
+Primary entrypoints:
+- src/ccbot/main.py (bootstrap)
+- src/ccbot/cli.py (CLI/env precedence)
+- src/ccbot/bot.py (handler wiring and routing)
+- src/ccbot/session.py (binding/state hub)
+- src/ccbot/session_monitor.py (polling + outbound event flow)
+- src/ccbot/providers/ (provider contract and implementations)
+- src/ccbot/handlers/ (Telegram command/callback surface)
+
+State and data files:
+- state.json: topic/thread bindings + window metadata
+- session_map.json: tmux window -> provider session mappings
+- events.jsonl: append-only hook events stream
+- monitor_state.json: incremental read offsets
+
+Canonical project references:
+- README.md
+- docs/guides.md
+- CLAUDE.md
+- .claude/rules/architecture.md
+- .claude/rules/topic-architecture.md
+- .claude/rules/message-handling.md
+
+Validation gate before done:
+- make fmt && make test && make lint
+
+Provider-specific implementation pointers:
+- src/ccbot/providers/base.py
+- src/ccbot/providers/__init__.py
+- src/ccbot/providers/claude.py
+- src/ccbot/providers/codex.py
+- src/ccbot/providers/gemini.py

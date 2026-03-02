@@ -12,7 +12,10 @@ make fmt                              # Format code
 make lint                             # Lint — MUST pass before committing
 make typecheck                        # Type check — MUST be 0 errors before committing
 make test                             # Run test suite
-./scripts/restart.sh                  # Restart the ccbot service after code changes
+./scripts/restart.sh start            # Start local dev instance in tmux ccbot:__main__
+./scripts/restart.sh restart          # Restart local dev instance (Ctrl-C in control pane)
+./scripts/restart.sh stop             # Stop local dev instance (Ctrl-\ in control pane)
+./scripts/restart.sh status           # Show control pane status and logs
 ccbot status                          # Show running state (no token needed)
 ccbot doctor                          # Validate setup and diagnose issues
 ccbot doctor --fix                    # Auto-fix issues (install hook, kill orphans)
