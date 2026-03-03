@@ -5,6 +5,7 @@ builtin command sets, capability flags, and shared JSONL parsing edge cases.
 """
 
 import json
+import hashlib
 import os
 import time
 from pathlib import Path
@@ -817,6 +818,31 @@ class TestGeminiTranscriptParsing:
         assert messages[0].text == "hello gemini"
         assert messages[0].role == "user"
 
+    def test_parses_user_array_content(self) -> None:
+        gemini = GeminiProvider()
+        entries = [
+            {
+                "type": "user",
+                "content": [{"text": "hello "}, {"text": "from array"}],
+            }
+        ]
+        messages, _ = gemini.parse_transcript_entries(entries, {})
+        assert len(messages) == 1
+        assert messages[0].text == "hello from array"
+        assert messages[0].role == "user"
+
+    def test_falls_back_to_display_content(self) -> None:
+        gemini = GeminiProvider()
+        entry = {
+            "type": "user",
+            "content": [{"meta": "ignored"}],
+            "displayContent": [{"text": "display text"}],
+        }
+        parsed = gemini.parse_history_entry(entry)
+        assert parsed is not None
+        assert parsed.text == "display text"
+        assert parsed.role == "user"
+
     def test_tracks_tool_calls(self) -> None:
         gemini = GeminiProvider()
         entries = [
@@ -829,6 +855,43 @@ class TestGeminiTranscriptParsing:
         messages, pending = gemini.parse_transcript_entries(entries, {})
         assert "tc1" in pending
         assert messages[0].content_type == "tool_use"
+
+    def test_emits_tool_result_and_clears_pending_when_result_present(self) -> None:
+        gemini = GeminiProvider()
+        entries = [
+            {
+                "type": "gemini",
+                "content": "",
+                "toolCalls": [
+                    {
+                        "id": "tc1",
+                        "name": "read_file",
+                        "displayName": "ReadFile",
+                        "args": {"file_path": "/tmp/x"},
+                        "resultDisplay": "ok",
+                    }
+                ],
+            }
+        ]
+        messages, pending = gemini.parse_transcript_entries(entries, {})
+        assert len(messages) == 2
+        assert messages[0].content_type == "tool_use"
+        assert messages[0].tool_name == "ReadFile"
+        assert messages[1].content_type == "tool_result"
+        assert messages[1].text == "ok"
+        assert "tc1" not in pending
+
+    def test_parses_info_and_error_entries_as_assistant(self) -> None:
+        gemini = GeminiProvider()
+        entries = [
+            {"type": "info", "content": "Request cancelled."},
+            {"type": "error", "content": "API error"},
+        ]
+        messages, _ = gemini.parse_transcript_entries(entries, {})
+        assert len(messages) == 2
+        assert all(m.role == "assistant" for m in messages)
+        assert messages[0].text == "Request cancelled."
+        assert messages[1].text == "API error"
 
     def test_skips_unknown_types(self) -> None:
         gemini = GeminiProvider()
@@ -871,6 +934,13 @@ class TestGeminiTerminalStatus:
         "  3. Allow for all future sessions\n"
         "  4. No, suggest changes (esc)\n"
     )
+    SELECT_MODEL_PANE = (
+        "Select Model\n"
+        "● 1. Auto (Gemini 3)\n"
+        "  2. Auto (Gemini 2.5)\n"
+        "  3. Manual\n"
+        "(Press Esc to close)\n"
+    )
 
     def test_detects_shell_permission(self) -> None:
         gemini = GeminiProvider()
@@ -885,6 +955,14 @@ class TestGeminiTerminalStatus:
         assert status is not None
         assert status.is_interactive is True
         assert status.ui_type == "PermissionPrompt"
+
+    def test_detects_selection_ui(self) -> None:
+        gemini = GeminiProvider()
+        status = gemini.parse_terminal_status(self.SELECT_MODEL_PANE)
+        assert status is not None
+        assert status.is_interactive is True
+        assert status.ui_type == "SelectionUI"
+        assert "Auto (Gemini 3)" in status.raw_text
 
     def test_permission_content_includes_options(self) -> None:
         gemini = GeminiProvider()
@@ -947,6 +1025,15 @@ class TestGeminiPaneTitleStatus:
         assert status.is_interactive is False
         assert status.display_label == "\u2026working"
 
+    def test_working_title_without_emoji_returns_working_status(self) -> None:
+        gemini = GeminiProvider()
+        status = gemini.parse_terminal_status(
+            "some output", pane_title="Working… (ccbot)"
+        )
+        assert status is not None
+        assert status.is_interactive is False
+        assert status.display_label == "\u2026working"
+
     def test_action_required_title_with_matching_content(self) -> None:
         gemini = GeminiProvider()
         pane = (
@@ -970,6 +1057,15 @@ class TestGeminiPaneTitleStatus:
         assert status.is_interactive is True
         assert status.ui_type == "PermissionPrompt"
 
+    def test_action_required_title_without_emoji_still_interactive(self) -> None:
+        gemini = GeminiProvider()
+        status = gemini.parse_terminal_status(
+            "some output", pane_title="Action Required (ccbot)"
+        )
+        assert status is not None
+        assert status.is_interactive is True
+        assert status.ui_type == "PermissionPrompt"
+
     def test_ready_title_returns_none(self) -> None:
         gemini = GeminiProvider()
         status = gemini.parse_terminal_status("some output", pane_title="Ready: ◇")
@@ -986,6 +1082,27 @@ class TestHooklessCommands:
         result = hookless.discover_commands("/tmp/nonexistent")
         names = {c.name for c in result}
         assert names == set(hookless.capabilities.builtin_commands)
+
+
+class TestGeminiCommandDiscovery:
+    def test_discovers_gemini_toml_commands_via_claude_base_dir(
+        self, tmp_path: Path
+    ) -> None:
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir(parents=True)
+        gemini_dir = tmp_path / ".gemini" / "commands" / "code"
+        gemini_dir.mkdir(parents=True)
+        (gemini_dir / "fix.toml").write_text(
+            "description = 'Fix all issues'\nprompt = '...'\n"
+        )
+
+        gemini = GeminiProvider()
+        commands = gemini.discover_commands(str(claude_dir))
+        names = {cmd.name for cmd in commands}
+        assert "code:fix" in names
+        discovered = next(cmd for cmd in commands if cmd.name == "code:fix")
+        assert discovered.description == "Fix all issues"
+        assert discovered.source == "command"
 
 
 # ── JSONL parsing edge cases (extract_content_blocks) ────────────────────
@@ -1197,6 +1314,28 @@ class TestGeminiMtimeCache:
 # ── Codex transcript discovery ─────────────────────────────────────────
 
 
+def _write_gemini_session(
+    tmp_dir: Path,
+    project_dir: str,
+    project_key: str,
+    session_name: str,
+    session_id: str,
+) -> Path:
+    """Write a minimal Gemini transcript and return its path."""
+    chats_dir = tmp_dir / ".gemini" / "tmp" / project_key / "chats"
+    chats_dir.mkdir(parents=True, exist_ok=True)
+    fpath = chats_dir / f"{session_name}.json"
+    payload = {
+        "sessionId": session_id,
+        "projectHash": hashlib.sha256(project_dir.encode()).hexdigest(),
+        "startTime": "2026-03-01T00:00:00.000Z",
+        "lastUpdated": "2026-03-01T00:00:00.000Z",
+        "messages": [],
+    }
+    fpath.write_text(json.dumps(payload))
+    return fpath
+
+
 def _write_codex_session(
     sessions_dir: Path, date_parts: str, name: str, session_id: str, cwd: str
 ) -> Path:
@@ -1373,11 +1512,102 @@ class TestCodexDiscoverTranscriptMaxAge:
         assert event.session_id == "uuid-abc"
 
 
-class TestHooklessDiscoverTranscriptDefault:
-    def test_gemini_returns_none(self) -> None:
-        gemini = GeminiProvider()
-        assert gemini.discover_transcript("/any/cwd", "ccbot:@0") is None
+class TestGeminiDiscoverTranscript:
+    def test_finds_session_via_project_hash_dir(self, tmp_path: Path) -> None:
+        project = "/my/project"
+        project_hash = hashlib.sha256(project.encode()).hexdigest()
+        fpath = _write_gemini_session(
+            tmp_path,
+            project,
+            project_hash,
+            "session-2026-03-02T12-00-00abcd",
+            "gemini-uuid-1",
+        )
 
+        gemini = GeminiProvider()
+        with patch.object(Path, "home", return_value=tmp_path):
+            event = gemini.discover_transcript(project, "ccbot:@7")
+        assert event is not None
+        assert event.session_id == "gemini-uuid-1"
+        assert event.cwd == project
+        assert event.transcript_path == str(fpath)
+        assert event.window_key == "ccbot:@7"
+
+    def test_finds_session_via_projects_alias(self, tmp_path: Path) -> None:
+        project = "/my/project"
+        fpath = _write_gemini_session(
+            tmp_path,
+            project,
+            "workspace-alias",
+            "session-2026-03-02T12-00-00abcd",
+            "gemini-uuid-2",
+        )
+        projects = {"projects": {project: "workspace-alias"}}
+        (tmp_path / ".gemini").mkdir(parents=True, exist_ok=True)
+        (tmp_path / ".gemini" / "projects.json").write_text(json.dumps(projects))
+
+        gemini = GeminiProvider()
+        with patch.object(Path, "home", return_value=tmp_path):
+            event = gemini.discover_transcript(project, "ccbot:@8")
+        assert event is not None
+        assert event.session_id == "gemini-uuid-2"
+        assert event.transcript_path == str(fpath)
+
+    def test_respects_staleness_by_default(self, tmp_path: Path) -> None:
+        project = "/my/project"
+        project_hash = hashlib.sha256(project.encode()).hexdigest()
+        fpath = _write_gemini_session(
+            tmp_path,
+            project,
+            project_hash,
+            "session-2026-03-01T09-00-00abcd",
+            "gemini-old",
+        )
+        old_time = fpath.stat().st_mtime - 300
+        os.utime(fpath, (old_time, old_time))
+
+        gemini = GeminiProvider()
+        with patch.object(Path, "home", return_value=tmp_path):
+            event = gemini.discover_transcript(project, "ccbot:@7")
+        assert event is None
+
+    def test_max_age_zero_ignores_staleness(self, tmp_path: Path) -> None:
+        project = "/my/project"
+        project_hash = hashlib.sha256(project.encode()).hexdigest()
+        fpath = _write_gemini_session(
+            tmp_path,
+            project,
+            project_hash,
+            "session-2026-03-01T09-00-00abcd",
+            "gemini-old",
+        )
+        old_time = fpath.stat().st_mtime - 300
+        os.utime(fpath, (old_time, old_time))
+
+        gemini = GeminiProvider()
+        with patch.object(Path, "home", return_value=tmp_path):
+            event = gemini.discover_transcript(project, "ccbot:@7", max_age=0)
+        assert event is not None
+        assert event.session_id == "gemini-old"
+        assert event.transcript_path == str(fpath)
+
+    def test_does_not_scan_unrelated_project_dirs(self, tmp_path: Path) -> None:
+        project = "/my/project"
+        _write_gemini_session(
+            tmp_path,
+            project,
+            "unrelated-dir-name",
+            "session-2026-03-02T12-00-00abcd",
+            "gemini-uuid-unrelated",
+        )
+
+        gemini = GeminiProvider()
+        with patch.object(Path, "home", return_value=tmp_path):
+            event = gemini.discover_transcript(project, "ccbot:@9")
+        assert event is None
+
+
+class TestHooklessDiscoverTranscriptDefault:
     def test_codex_returns_none_when_no_sessions(self, tmp_path: Path) -> None:
         codex = CodexProvider()
         with patch.object(Path, "home", return_value=tmp_path):

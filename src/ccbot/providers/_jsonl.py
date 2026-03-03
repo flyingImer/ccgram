@@ -216,6 +216,8 @@ class JsonlProvider:
         self,
         cwd: str,  # noqa: ARG002 — protocol signature
         window_key: str,  # noqa: ARG002 — protocol signature
+        *,
+        max_age: float | None = None,  # noqa: ARG002 — protocol signature
     ) -> SessionStartEvent | None:
         return None
 

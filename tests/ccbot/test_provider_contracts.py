@@ -399,6 +399,14 @@ class TestDiscoverTranscript:
         # All providers should return None for a nonexistent path
         assert result is None
 
+    def test_accepts_optional_max_age_kwarg(self, provider: AgentProvider) -> None:
+        result = provider.discover_transcript(
+            "/nonexistent/path",
+            "ccbot:@99",
+            max_age=0,
+        )
+        assert result is None
+
 
 class TestDiscoverCommands:
     def test_returns_list_of_discovered_commands(self, provider: AgentProvider) -> None:

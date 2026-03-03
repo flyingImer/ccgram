@@ -222,13 +222,18 @@ class AgentProvider(Protocol):
         ...
 
     def discover_transcript(
-        self, cwd: str, window_key: str
+        self,
+        cwd: str,
+        window_key: str,
+        *,
+        max_age: float | None = None,
     ) -> SessionStartEvent | None:
         """Discover transcript for a hookless provider session.
 
         Scans the provider's session storage for the most recent transcript
         matching the given working directory. Returns a SessionStartEvent
-        if found, None otherwise.
+        if found, None otherwise. Implementations may optionally honor
+        ``max_age`` (seconds) to ignore stale transcript files.
 
         Only useful for providers without hook support (Codex, Gemini).
         Providers with hooks (Claude) return None.
