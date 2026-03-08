@@ -326,11 +326,11 @@ class TestStatusPollingIntegration:
             ),
         ):
             from ccbot.handlers.status_polling import (
-                _has_seen_status,
+                _get_window_state,
                 update_status_message,
             )
 
-            _has_seen_status.add("@0")
+            _get_window_state("@0").has_seen_status = True
 
             mock_window = MagicMock()
             mock_window.pane_current_command = "node"
@@ -361,11 +361,11 @@ class TestStatusPollingIntegration:
             ),
         ):
             from ccbot.handlers.status_polling import (
-                _has_seen_status,
+                _window_poll_state,
                 update_status_message,
             )
 
-            _has_seen_status.discard("@99")
+            _window_poll_state.pop("@99", None)
 
             mock_window = MagicMock()
             mock_window.pane_current_command = "node"

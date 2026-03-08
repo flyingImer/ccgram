@@ -28,6 +28,7 @@ import asyncio
 import contextlib
 import structlog
 import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -76,32 +77,16 @@ STATUS_POLL_INTERVAL = 1.0  # seconds - faster response (rate limiting at send l
 # Topic existence probe interval
 TOPIC_CHECK_INTERVAL = 60.0  # seconds
 
-# Track which (user_id, thread_id, window_id) tuples have been notified about death
-_dead_notified: set[tuple[int, int, str]] = set()
-
 # Shell commands indicating Claude has exited and the shell prompt is back
 SHELL_COMMANDS = frozenset({"bash", "zsh", "fish", "sh", "dash", "tcsh", "csh", "ksh"})
 
-# Auto-close timers: (user_id, thread_id) -> (state, monotonic_time_entered)
-_autoclose_timers: dict[tuple[int, int], tuple[str, float]] = {}
-
-# Unbound window TTL: window_id -> monotonic_time_first_seen_unbound
-_unbound_window_timers: dict[str, float] = {}
-
-# Windows where we've observed at least one status line (spinner).
-# Until a spinner is seen, the window is treated as "active" (starting up),
-# not "idle", to avoid showing 💤 during Claude Code startup.
-_has_seen_status: set[str] = set()
-
-# Consecutive topic probe failures per window_id. After _MAX_PROBE_FAILURES
+# Consecutive topic probe failure threshold. After _MAX_PROBE_FAILURES
 # consecutive timeouts, probing is suspended to stop log spam and useless API calls.
 _MAX_PROBE_FAILURES = 3
-_probe_failures: dict[str, int] = {}
 
-# Typing indicator throttle: (user_id, thread_id) -> monotonic time last sent.
+# Typing indicator throttle interval.
 # Telegram typing action expires after ~5s; we re-send every 4s.
 _TYPING_INTERVAL = 4.0
-_last_typing_sent: dict[tuple[int, int], float] = {}
 
 # Transcript activity heuristic: if transcript was written to within this many
 # seconds, treat the window as active even without a terminal status signal.
@@ -110,19 +95,55 @@ _ACTIVITY_THRESHOLD = 10.0
 # Startup timeout: after this many seconds without any status or transcript
 # activity, transition from "starting up" to idle instead of staying green forever.
 _STARTUP_TIMEOUT = 30.0
-_startup_times: dict[
-    str, float
-] = {}  # window_id -> monotonic time first seen without status
 
-# Per-window pyte ScreenBuffer for ANSI-aware parsing
-_screen_buffers: dict[str, ScreenBuffer] = {}
+
+# ── Consolidated per-window and per-topic polling state ────────────────
+
+
+@dataclass
+class WindowPollState:
+    """Per-window polling state, keyed by window_id."""
+
+    has_seen_status: bool = False
+    startup_time: float | None = None
+    probe_failures: int = 0
+    screen_buffer: ScreenBuffer | None = field(default=None, repr=False)
+    pane_count_cache: tuple[int, float] | None = None
+    unbound_timer: float | None = None
+
+
+@dataclass
+class TopicPollState:
+    """Per-topic polling state, keyed by (user_id, thread_id)."""
+
+    autoclose: tuple[str, float] | None = None
+    last_typing_sent: float | None = None
+
+
+_window_poll_state: dict[str, WindowPollState] = {}
+_topic_poll_state: dict[tuple[int, int], TopicPollState] = {}
+
+# These stay as separate module-level state (different key patterns):
+_dead_notified: set[tuple[int, int, str]] = set()
+_pane_alert_hashes: dict[str, tuple[str, float, str]] = {}
+
+
+def _get_window_state(window_id: str) -> WindowPollState:
+    """Get or create WindowPollState for a window."""
+    return _window_poll_state.setdefault(window_id, WindowPollState())
+
+
+def _get_topic_state(user_id: int, thread_id: int) -> TopicPollState:
+    """Get or create TopicPollState for a topic."""
+    return _topic_poll_state.setdefault((user_id, thread_id), TopicPollState())
 
 
 def _get_screen_buffer(window_id: str, columns: int, rows: int) -> ScreenBuffer:
     """Get or create a ScreenBuffer for a window, resizing if needed."""
     from ..screen_buffer import ScreenBuffer
 
-    buf = _screen_buffers.get(window_id)
+    ws = _get_window_state(window_id)
+    buf = ws.screen_buffer
     if (
         buf is None
         or not isinstance(buf, ScreenBuffer)
@@ -130,7 +151,7 @@ def _get_screen_buffer(window_id: str, columns: int, rows: int) -> ScreenBuffer:
         or buf.rows != rows
     ):
         buf = ScreenBuffer(columns=columns, rows=rows)
-        _screen_buffers[window_id] = buf
+        ws.screen_buffer = buf
     else:
         buf.reset()
     return buf
@@ -138,14 +159,27 @@ def _get_screen_buffer(window_id: str, columns: int, rows: int) -> ScreenBuffer:
 
 def clear_screen_buffer(window_id: str) -> None:
     """Remove a window's ScreenBuffer and pane count cache (called on cleanup)."""
-    _screen_buffers.pop(window_id, None)
-    _pane_count_cache.pop(window_id, None)
+    ws = _window_poll_state.get(window_id)
+    if ws:
+        ws.screen_buffer = None
+        ws.pane_count_cache = None
+
+
+def clear_window_poll_state(window_id: str) -> None:
+    """Remove all polling state for a window."""
+    _window_poll_state.pop(window_id, None)
+
+
+def clear_topic_poll_state(user_id: int, thread_id: int) -> None:
+    """Remove all polling state for a topic."""
+    _topic_poll_state.pop((user_id, thread_id), None)
 
 
 def reset_screen_buffer_state() -> None:
     """Reset all ScreenBuffers and caches (for testing)."""
-    _screen_buffers.clear()
-    _pane_count_cache.clear()
+    for ws in _window_poll_state.values():
+        ws.screen_buffer = None
+        ws.pane_count_cache = None
     _pane_alert_hashes.clear()
 
 
@@ -159,11 +193,11 @@ async def _send_typing_throttled(bot: Bot, user_id: int, thread_id: int | None) 
     """Send typing indicator if enough time has elapsed since the last one."""
     if thread_id is None:
         return
-    key = (user_id, thread_id)
+    ts = _get_topic_state(user_id, thread_id)
     now = time.monotonic()
-    if now - _last_typing_sent.get(key, 0.0) < _TYPING_INTERVAL:
+    if now - (ts.last_typing_sent or 0.0) < _TYPING_INTERVAL:
         return
-    _last_typing_sent[key] = now
+    ts.last_typing_sent = now
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     with contextlib.suppress(TelegramError):
         await bot.send_chat_action(
@@ -175,13 +209,17 @@ async def _send_typing_throttled(bot: Bot, user_id: int, thread_id: int | None) 
 
 def clear_autoclose_timer(user_id: int, thread_id: int) -> None:
     """Remove autoclose timer for a topic (called on cleanup)."""
-    _autoclose_timers.pop((user_id, thread_id), None)
+    ts = _topic_poll_state.get((user_id, thread_id))
+    if ts:
+        ts.autoclose = None
 
 
 def reset_autoclose_state() -> None:
     """Reset all autoclose tracking (for testing)."""
-    _autoclose_timers.clear()
-    _unbound_window_timers.clear()
+    for ts in _topic_poll_state.values():
+        ts.autoclose = None
+    for ws in _window_poll_state.values():
+        ws.unbound_timer = None
 
 
 def clear_dead_notification(user_id: int, thread_id: int) -> None:
@@ -198,49 +236,60 @@ def reset_dead_notification_state() -> None:
 
 def clear_probe_failures(window_id: str) -> None:
     """Reset probe failure counter for a window (e.g. on user activity)."""
-    _probe_failures.pop(window_id, None)
+    ws = _window_poll_state.get(window_id)
+    if ws:
+        ws.probe_failures = 0
 
 
 def reset_probe_failures_state() -> None:
     """Reset all probe failure tracking (for testing)."""
-    _probe_failures.clear()
+    for ws in _window_poll_state.values():
+        ws.probe_failures = 0
 
 
 def clear_typing_state(user_id: int, thread_id: int) -> None:
     """Clear typing indicator throttle for a topic (called on cleanup)."""
-    _last_typing_sent.pop((user_id, thread_id), None)
+    ts = _topic_poll_state.get((user_id, thread_id))
+    if ts:
+        ts.last_typing_sent = None
 
 
 def clear_seen_status(window_id: str) -> None:
     """Clear startup status tracking for a window (called on cleanup)."""
-    _has_seen_status.discard(window_id)
-    _startup_times.pop(window_id, None)
+    ws = _window_poll_state.get(window_id)
+    if ws:
+        ws.has_seen_status = False
+        ws.startup_time = None
 
 
 def reset_seen_status_state() -> None:
     """Reset all startup status tracking (for testing)."""
-    _has_seen_status.clear()
-    _startup_times.clear()
+    for ws in _window_poll_state.values():
+        ws.has_seen_status = False
+        ws.startup_time = None
 
 
 def reset_typing_state() -> None:
     """Reset all typing indicator tracking (for testing)."""
-    _last_typing_sent.clear()
+    for ts in _topic_poll_state.values():
+        ts.last_typing_sent = None
 
 
 def _start_autoclose_timer(
     user_id: int, thread_id: int, state: str, now: float
 ) -> None:
     """Start or maintain an autoclose timer for a topic in done/dead state."""
-    key = (user_id, thread_id)
-    existing = _autoclose_timers.get(key)
+    ts = _get_topic_state(user_id, thread_id)
+    existing = ts.autoclose
     if existing is None or existing[0] != state:
-        _autoclose_timers[key] = (state, now)
+        ts.autoclose = (state, now)
 
 
 def _clear_autoclose_if_active(user_id: int, thread_id: int) -> None:
     """Clear autoclose timer when topic becomes active/idle (session alive)."""
-    _autoclose_timers.pop((user_id, thread_id), None)
+    ts = _topic_poll_state.get((user_id, thread_id))
+    if ts:
+        ts.autoclose = None
 
 
 async def _check_unbound_window_ttl(live_windows: list | None = None) -> None:
@@ -269,26 +318,28 @@ async def _check_unbound_window_ttl(live_windows: list | None = None) -> None:
     live_ids = {w.window_id for w in live_windows}
 
     # Remove timers for windows that got rebound or no longer exist
-    stale_timer_keys = [
-        wid for wid in _unbound_window_timers if wid in bound_ids or wid not in live_ids
-    ]
-    for wid in stale_timer_keys:
-        del _unbound_window_timers[wid]
+    for wid, ws in list(_window_poll_state.items()):
+        if ws.unbound_timer is not None and (wid in bound_ids or wid not in live_ids):
+            ws.unbound_timer = None
 
     # Track newly unbound windows
     now = time.monotonic()
     for w in live_windows:
         if w.window_id not in bound_ids:
-            _unbound_window_timers.setdefault(w.window_id, now)
+            ws = _get_window_state(w.window_id)
+            if ws.unbound_timer is None:
+                ws.unbound_timer = now
 
     # Kill expired unbound windows
     expired = [
         wid
-        for wid, first_seen in _unbound_window_timers.items()
-        if now - first_seen >= timeout
+        for wid, ws in _window_poll_state.items()
+        if ws.unbound_timer is not None and now - ws.unbound_timer >= timeout
     ]
     for wid in expired:
-        _unbound_window_timers.pop(wid, None)
+        ws = _window_poll_state.get(wid)
+        if ws:
+            ws.unbound_timer = None
         from ..tmux_manager import clear_vim_state
 
         clear_vim_state(wid)
@@ -298,13 +349,16 @@ async def _check_unbound_window_ttl(live_windows: list | None = None) -> None:
 
 async def _check_autoclose_timers(bot: Bot) -> None:
     """Close topics whose done/dead timers have expired."""
-    if not _autoclose_timers:
+    if not _topic_poll_state:
         return
 
     now = time.monotonic()
     expired: list[tuple[int, int]] = []
 
-    for (user_id, thread_id), (state, entered_at) in _autoclose_timers.items():
+    for (user_id, thread_id), ts in _topic_poll_state.items():
+        if ts.autoclose is None:
+            continue
+        state, entered_at = ts.autoclose
         if state == "done":
             timeout = config.autoclose_done_minutes * 60
         elif state == "dead":
@@ -319,7 +373,9 @@ async def _check_autoclose_timers(bot: Bot) -> None:
             expired.append((user_id, thread_id))
 
     for user_id, thread_id in expired:
-        _autoclose_timers.pop((user_id, thread_id), None)
+        ts = _topic_poll_state.get((user_id, thread_id))
+        if ts:
+            ts.autoclose = None
         chat_id = session_manager.resolve_chat_id(user_id, thread_id)
         try:
             await bot.close_forum_topic(chat_id=chat_id, message_thread_id=thread_id)
@@ -348,8 +404,9 @@ def _check_transcript_activity(window_id: str, now: float) -> bool:
         return False
     last_activity = mon.get_last_activity(session_id)
     if last_activity and (now - last_activity) < _ACTIVITY_THRESHOLD:
-        _has_seen_status.add(window_id)
-        _startup_times.pop(window_id, None)
+        ws = _get_window_state(window_id)
+        ws.has_seen_status = True
+        ws.startup_time = None
         return True
     return False
 
@@ -364,10 +421,10 @@ async def _transition_to_idle(
     notif_mode: str,
 ) -> None:
     """Transition a window to idle state (emoji, autoclose, typing, status)."""
-    _startup_times.pop(window_id, None)
+    _get_window_state(window_id).startup_time = None
     await update_topic_emoji(bot, chat_id, thread_id, "idle", display)
     _clear_autoclose_if_active(user_id, thread_id)
-    _last_typing_sent.pop((user_id, thread_id), None)
+    _get_topic_state(user_id, thread_id).last_typing_sent = None
     if notif_mode not in ("muted", "errors_only"):
         from .callback_data import IDLE_STATUS_TEXT
 
@@ -408,9 +465,10 @@ async def _handle_no_status(
 
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     display = session_manager.get_display_name(window_id)
+    ws = _get_window_state(window_id)
 
     if is_shell_prompt(pane_current_command):
-        _startup_times.pop(window_id, None)
+        ws.startup_time = None
         # Hookless providers (Codex/Gemini) often sit at shell-like prompts while
         # still being an active topic. Keep idle controls visible instead of
         # clearing the status message.
@@ -418,7 +476,7 @@ async def _handle_no_status(
         raw_provider = getattr(state, "provider_name", "")
         provider_name = raw_provider.lower() if isinstance(raw_provider, str) else ""
         if provider_name in ("codex", "gemini"):
-            _has_seen_status.add(window_id)
+            ws.has_seen_status = True
             await _transition_to_idle(
                 bot, user_id, window_id, thread_id, chat_id, display, notif_mode
             )
@@ -426,21 +484,21 @@ async def _handle_no_status(
 
         await update_topic_emoji(bot, chat_id, thread_id, "done", display)
         _start_autoclose_timer(user_id, thread_id, "done", now)
-        _last_typing_sent.pop((user_id, thread_id), None)
+        _get_topic_state(user_id, thread_id).last_typing_sent = None
         await enqueue_status_update(bot, user_id, window_id, None, thread_id=thread_id)
-    elif window_id in _has_seen_status:
+    elif ws.has_seen_status:
         await _transition_to_idle(
             bot, user_id, window_id, thread_id, chat_id, display, notif_mode
         )
-    elif window_id not in _startup_times:
+    elif ws.startup_time is None:
         # First poll without status — start grace period
-        _startup_times[window_id] = now
+        ws.startup_time = now
         await _send_typing_throttled(bot, user_id, thread_id)
         await update_topic_emoji(bot, chat_id, thread_id, "active", display)
         _clear_autoclose_if_active(user_id, thread_id)
-    elif now - _startup_times[window_id] >= _STARTUP_TIMEOUT:
+    elif now - ws.startup_time >= _STARTUP_TIMEOUT:
         # Startup timed out — treat as idle
-        _has_seen_status.add(window_id)
+        ws.has_seen_status = True
         await _transition_to_idle(
             bot, user_id, window_id, thread_id, chat_id, display, notif_mode
         )
@@ -500,10 +558,6 @@ def _parse_with_pyte(window_id: str, pane_text: str) -> StatusUpdate | None:
 # are surfaced in the Telegram topic.
 
 
-# pane_id -> (prompt_text, last_seen_monotonic, window_id)
-_pane_alert_hashes: dict[str, tuple[str, float, str]] = {}
-
-
 def has_pane_alert(pane_id: str) -> bool:
     """Check whether a pane currently has an active alert."""
     return pane_id in _pane_alert_hashes
@@ -516,9 +570,6 @@ def clear_pane_alerts(window_id: str) -> None:
         _pane_alert_hashes.pop(pid, None)
 
 
-# Cache pane counts to avoid subprocess per poll cycle for single-pane windows.
-# window_id -> (pane_count, expires_at_monotonic)
-_pane_count_cache: dict[str, tuple[int, float]] = {}
 _PANE_COUNT_TTL = 5.0  # seconds
 
 
@@ -534,12 +585,13 @@ async def _scan_window_panes(
     a subprocess call. Cache refreshes every 5 seconds.
     """
     now = time.monotonic()
-    cached = _pane_count_cache.get(window_id)
+    ws = _get_window_state(window_id)
+    cached = ws.pane_count_cache
     if cached and cached[1] > now and cached[0] <= 1:
         return  # Cached single-pane — no subprocess needed
 
     panes = await tmux_manager.list_panes(window_id)
-    _pane_count_cache[window_id] = (len(panes), now + _PANE_COUNT_TTL)
+    ws.pane_count_cache = (len(panes), now + _PANE_COUNT_TTL)
     live_pane_ids = {p.pane_id for p in panes}
 
     # Clean up alerts for panes of THIS window that no longer exist
@@ -665,8 +717,9 @@ async def update_status_message(
     notif_mode = session_manager.get_notification_mode(window_id)
 
     if status_line:
-        _has_seen_status.add(window_id)
-        _startup_times.pop(window_id, None)
+        ws = _get_window_state(window_id)
+        ws.has_seen_status = True
+        ws.startup_time = None
         await _send_typing_throttled(bot, user_id, thread_id)
         if notif_mode not in ("muted", "errors_only"):
             # Append subagent count if any are active
@@ -702,7 +755,7 @@ async def _handle_dead_window_notification(
     dead_key = (user_id, thread_id, wid)
     if dead_key in _dead_notified:
         return
-    _has_seen_status.discard(wid)
+    _get_window_state(wid).has_seen_status = False
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)
     display = session_manager.get_display_name(wid)
     await update_topic_emoji(bot, chat_id, thread_id, "dead", display)
@@ -737,8 +790,9 @@ async def _handle_dead_window_notification(
 
 def _record_probe_failure(window_id: str) -> int:
     """Increment probe failure counter; log once when threshold is reached."""
-    count = _probe_failures.get(window_id, 0) + 1
-    _probe_failures[window_id] = count
+    ws = _get_window_state(window_id)
+    ws.probe_failures += 1
+    count = ws.probe_failures
     if count == _MAX_PROBE_FAILURES:
         logger.info(
             "Suspending topic probe for %s after %d consecutive failures",
@@ -763,21 +817,21 @@ async def _prune_stale_state(live_windows: list) -> None:
 async def _probe_topic_existence(bot: Bot) -> None:
     """Probe all bound topics via Telegram API; detect deleted topics."""
     for user_id, thread_id, wid in list(session_manager.iter_thread_bindings()):
-        if _probe_failures.get(wid, 0) >= _MAX_PROBE_FAILURES:
+        if _get_window_state(wid).probe_failures >= _MAX_PROBE_FAILURES:
             continue
         try:
             await bot.unpin_all_forum_topic_messages(
                 chat_id=session_manager.resolve_chat_id(user_id, thread_id),
                 message_thread_id=thread_id,
             )
-            _probe_failures.pop(wid, None)
+            _get_window_state(wid).probe_failures = 0
         except TelegramError as e:
             if isinstance(e, BadRequest) and "Topic_id_invalid" in e.message:
                 # Topic deleted — kill window, unbind, and clean up state
                 w = await tmux_manager.find_window_by_id(wid)
                 if w:
                     await tmux_manager.kill_window(w.window_id)
-                _probe_failures.pop(wid, None)
+                _get_window_state(wid).probe_failures = 0
                 await clear_topic_state(user_id, thread_id, bot, window_id=wid)
                 session_manager.unbind_thread(user_id, thread_id)
                 logger.info(

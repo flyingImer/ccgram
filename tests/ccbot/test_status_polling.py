@@ -11,34 +11,39 @@ from telegram.error import BadRequest, TelegramError
 from conftest import make_mock_provider
 
 from ccbot.handlers.status_polling import (
-    _autoclose_timers,
     _check_autoclose_timers,
     _check_transcript_activity,
     _clear_autoclose_if_active,
-    _has_seen_status,
+    _get_window_state,
     _MAX_PROBE_FAILURES,
-    _probe_failures,
     _probe_topic_existence,
     _prune_stale_state,
     _start_autoclose_timer,
-    _startup_times,
+    _topic_poll_state,
+    _window_poll_state,
     clear_autoclose_timer,
     is_shell_prompt,
-    reset_autoclose_state,
-    reset_probe_failures_state,
-    reset_seen_status_state,
 )
+
+
+# Helpers for readable assertions on dataclass-based state
+def _has_autoclose(user_id: int, thread_id: int) -> bool:
+    ts = _topic_poll_state.get((user_id, thread_id))
+    return ts is not None and ts.autoclose is not None
+
+
+def _get_autoclose(user_id: int, thread_id: int) -> tuple[str, float] | None:
+    ts = _topic_poll_state.get((user_id, thread_id))
+    return ts.autoclose if ts else None
 
 
 @pytest.fixture(autouse=True)
 def _reset():
-    reset_autoclose_state()
-    reset_seen_status_state()
-    reset_probe_failures_state()
+    _window_poll_state.clear()
+    _topic_poll_state.clear()
     yield
-    reset_autoclose_state()
-    reset_seen_status_state()
-    reset_probe_failures_state()
+    _window_poll_state.clear()
+    _topic_poll_state.clear()
 
 
 class TestIsShellPrompt:
@@ -57,27 +62,27 @@ class TestIsShellPrompt:
 class TestAutocloseTimers:
     def test_start_timer(self) -> None:
         _start_autoclose_timer(1, 42, "done", 100.0)
-        assert _autoclose_timers[(1, 42)] == ("done", 100.0)
+        assert _get_autoclose(1, 42) == ("done", 100.0)
 
     def test_start_timer_preserves_existing_same_state(self) -> None:
         _start_autoclose_timer(1, 42, "done", 100.0)
         _start_autoclose_timer(1, 42, "done", 200.0)
-        assert _autoclose_timers[(1, 42)] == ("done", 100.0)
+        assert _get_autoclose(1, 42) == ("done", 100.0)
 
     def test_start_timer_resets_on_state_change(self) -> None:
         _start_autoclose_timer(1, 42, "done", 100.0)
         _start_autoclose_timer(1, 42, "dead", 200.0)
-        assert _autoclose_timers[(1, 42)] == ("dead", 200.0)
+        assert _get_autoclose(1, 42) == ("dead", 200.0)
 
     def test_clear_on_active(self) -> None:
         _start_autoclose_timer(1, 42, "done", 100.0)
         _clear_autoclose_if_active(1, 42)
-        assert (1, 42) not in _autoclose_timers
+        assert not _has_autoclose(1, 42)
 
     def test_clear_timer(self) -> None:
         _start_autoclose_timer(1, 42, "done", 100.0)
         clear_autoclose_timer(1, 42)
-        assert (1, 42) not in _autoclose_timers
+        assert not _has_autoclose(1, 42)
 
     def test_clear_nonexistent_is_noop(self) -> None:
         clear_autoclose_timer(1, 42)
@@ -105,7 +110,7 @@ class TestAutocloseTimers:
         bot.close_forum_topic.assert_called_once_with(
             chat_id=-100, message_thread_id=42
         )
-        assert (1, 42) not in _autoclose_timers
+        assert not _has_autoclose(1, 42)
 
     async def test_check_not_expired_yet(self) -> None:
         _start_autoclose_timer(1, 42, "done", 0.0)
@@ -119,7 +124,7 @@ class TestAutocloseTimers:
             mock_time.monotonic.return_value = 29 * 60
             await _check_autoclose_timers(bot)
         bot.close_forum_topic.assert_not_called()
-        assert (1, 42) in _autoclose_timers
+        assert _has_autoclose(1, 42)
 
     async def test_check_disabled_when_zero(self) -> None:
         _start_autoclose_timer(1, 42, "done", 0.0)
@@ -148,7 +153,7 @@ class TestAutocloseTimers:
             mock_time.monotonic.return_value = 30 * 60 + 1
             mock_sm.resolve_chat_id.return_value = -100
             await _check_autoclose_timers(bot)
-        assert (1, 42) not in _autoclose_timers
+        assert not _has_autoclose(1, 42)
 
 
 class TestTranscriptActivityHeuristic:
@@ -166,7 +171,7 @@ class TestTranscriptActivityHeuristic:
             mock_sm.get_session_id_for_window.return_value = "sess-123"
             result = _check_transcript_activity("@0", now)
         assert result is True
-        assert "@0" in _has_seen_status
+        assert _window_poll_state.get("@0") and _window_poll_state["@0"].has_seen_status
 
     def test_inactive_when_stale_transcript(self) -> None:
         now = time.monotonic()
@@ -182,7 +187,9 @@ class TestTranscriptActivityHeuristic:
             mock_sm.get_session_id_for_window.return_value = "sess-123"
             result = _check_transcript_activity("@0", now)
         assert result is False
-        assert "@0" not in _has_seen_status
+        assert not (
+            _window_poll_state.get("@0") and _window_poll_state["@0"].has_seen_status
+        )
 
     def test_inactive_when_no_session(self) -> None:
         now = time.monotonic()
@@ -206,7 +213,8 @@ class TestTranscriptActivityHeuristic:
 
     def test_clears_startup_timer_on_activity(self) -> None:
         now = time.monotonic()
-        _startup_times["@0"] = now - 15.0
+
+        _get_window_state("@0").startup_time = now - 15.0
         mock_monitor = MagicMock()
         mock_monitor.get_last_activity.return_value = now - 3.0
         with (
@@ -219,7 +227,10 @@ class TestTranscriptActivityHeuristic:
             mock_sm.get_session_id_for_window.return_value = "sess-123"
             result = _check_transcript_activity("@0", now)
         assert result is True
-        assert "@0" not in _startup_times
+        assert (
+            _window_poll_state.get("@0") is None
+            or _window_poll_state["@0"].startup_time is None
+        )
 
 
 class TestStartupTimeout:
@@ -241,13 +252,16 @@ class TestStartupTimeout:
             mock_sm.resolve_chat_id.return_value = -100
             mock_sm.get_display_name.return_value = "project"
             await _handle_no_status(bot, 1, "@0", 42, "node", "normal")
-        assert "@0" in _startup_times
+        assert (
+            _window_poll_state.get("@0") is not None
+            and _window_poll_state["@0"].startup_time is not None
+        )
 
     async def test_startup_timeout_transitions_to_idle(self) -> None:
         from ccbot.handlers.status_polling import _handle_no_status
 
         bot = AsyncMock()
-        _startup_times["@0"] = 1000.0
+        _get_window_state("@0").startup_time = 1000.0
         with (
             patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
             patch("ccbot.handlers.status_polling.update_topic_emoji") as mock_emoji,
@@ -262,15 +276,18 @@ class TestStartupTimeout:
             mock_sm.resolve_chat_id.return_value = -100
             mock_sm.get_display_name.return_value = "project"
             await _handle_no_status(bot, 1, "@0", 42, "node", "normal")
-        assert "@0" in _has_seen_status
-        assert "@0" not in _startup_times
+        assert _window_poll_state.get("@0") and _window_poll_state["@0"].has_seen_status
+        assert (
+            _window_poll_state.get("@0") is None
+            or _window_poll_state["@0"].startup_time is None
+        )
         mock_emoji.assert_called_once_with(bot, -100, 42, "idle", "project")
 
     async def test_startup_grace_period_sends_typing(self) -> None:
         from ccbot.handlers.status_polling import _handle_no_status
 
         bot = AsyncMock()
-        _startup_times["@0"] = 1000.0
+        _get_window_state("@0").startup_time = 1000.0
         with (
             patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
             patch("ccbot.handlers.status_polling.update_topic_emoji") as mock_emoji,
@@ -289,7 +306,9 @@ class TestStartupTimeout:
             await _handle_no_status(bot, 1, "@0", 42, "node", "normal")
         mock_typing.assert_called_once_with(bot, 1, 42)
         mock_emoji.assert_called_once_with(bot, -100, 42, "active", "project")
-        assert "@0" not in _has_seen_status
+        assert not (
+            _window_poll_state.get("@0") and _window_poll_state["@0"].has_seen_status
+        )
 
 
 class TestParseWithPyte:
@@ -349,16 +368,18 @@ class TestParseWithPyte:
         assert result is None
 
     def test_screen_buffer_cached_per_window(self) -> None:
-        from ccbot.handlers.status_polling import _parse_with_pyte, _screen_buffers
+        from ccbot.handlers.status_polling import _parse_with_pyte
 
         sep = "─" * 30
         pane_text = f"Output\n✻ Working\n{sep}\n"
         _parse_with_pyte("@0", pane_text)
-        assert "@0" in _screen_buffers
+        assert _window_poll_state.get("@0") is not None
+        assert _window_poll_state["@0"].screen_buffer is not None
 
         _parse_with_pyte("@1", pane_text)
-        assert "@1" in _screen_buffers
-        assert "@0" in _screen_buffers
+        assert _window_poll_state.get("@1") is not None
+        assert _window_poll_state["@1"].screen_buffer is not None
+        assert _window_poll_state["@0"].screen_buffer is not None
 
     def test_interactive_takes_precedence_over_status(self) -> None:
         from ccbot.handlers.status_polling import _parse_with_pyte
@@ -472,11 +493,16 @@ class TestClearSeenStatus:
     def test_clears_seen_status_and_startup(self) -> None:
         from ccbot.handlers.status_polling import clear_seen_status
 
-        _has_seen_status.add("@0")
-        _startup_times["@0"] = 100.0
+        _get_window_state("@0").has_seen_status = True
+        _get_window_state("@0").startup_time = 100.0
         clear_seen_status("@0")
-        assert "@0" not in _has_seen_status
-        assert "@0" not in _startup_times
+        assert not (
+            _window_poll_state.get("@0") and _window_poll_state["@0"].has_seen_status
+        )
+        assert (
+            _window_poll_state.get("@0") is None
+            or _window_poll_state["@0"].startup_time is None
+        )
 
 
 class TestTransitionToIdle:
@@ -517,7 +543,7 @@ class TestShellPromptClearsStatus:
     async def test_shell_prompt_enqueues_status_clear(self) -> None:
         from ccbot.handlers.status_polling import _handle_no_status
 
-        _has_seen_status.add("@0")
+        _get_window_state("@0").has_seen_status = True
         bot = AsyncMock()
         with (
             patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
@@ -541,7 +567,7 @@ class TestShellPromptClearsStatus:
         from ccbot.handlers.callback_data import IDLE_STATUS_TEXT
         from ccbot.handlers.status_polling import _handle_no_status
 
-        _has_seen_status.add("@0")
+        _get_window_state("@0").has_seen_status = True
         bot = AsyncMock()
         with (
             patch("ccbot.handlers.status_polling.session_manager") as mock_sm,
@@ -564,12 +590,12 @@ class TestShellPromptClearsStatus:
         mock_enqueue.assert_called_once_with(
             bot, 1, "@0", IDLE_STATUS_TEXT, thread_id=42
         )
-        assert (1, 42) not in _autoclose_timers
+        assert not _has_autoclose(1, 42)
 
 
 class TestProbeFailures:
     async def test_probe_skips_suspended_windows(self) -> None:
-        _probe_failures["@5"] = _MAX_PROBE_FAILURES
+        _get_window_state("@5").probe_failures = _MAX_PROBE_FAILURES
         bot = AsyncMock()
         with patch("ccbot.handlers.status_polling.session_manager") as mock_sm:
             mock_sm.iter_thread_bindings.return_value = [(1, 42, "@5")]
@@ -577,13 +603,16 @@ class TestProbeFailures:
         bot.unpin_all_forum_topic_messages.assert_not_called()
 
     async def test_probe_success_resets_counter(self) -> None:
-        _probe_failures["@5"] = 2
+        _get_window_state("@5").probe_failures = 2
         bot = AsyncMock()
         with patch("ccbot.handlers.status_polling.session_manager") as mock_sm:
             mock_sm.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_sm.resolve_chat_id.return_value = -100
             await _probe_topic_existence(bot)
-        assert "@5" not in _probe_failures
+        assert (
+            _window_poll_state.get("@5") is None
+            or _window_poll_state["@5"].probe_failures == 0
+        )
         bot.unpin_all_forum_topic_messages.assert_called_once_with(
             chat_id=-100, message_thread_id=42
         )
@@ -602,7 +631,7 @@ class TestProbeFailures:
             mock_sm.iter_thread_bindings.return_value = [(1, 42, "@5")]
             mock_sm.resolve_chat_id.return_value = -100
             await _probe_topic_existence(bot)
-        assert _probe_failures["@5"] == 1
+        assert _window_poll_state["@5"].probe_failures == 1
 
     async def test_probe_suspends_after_max_failures(self) -> None:
         bot = AsyncMock()
@@ -613,7 +642,7 @@ class TestProbeFailures:
             for _ in range(_MAX_PROBE_FAILURES + 1):
                 await _probe_topic_existence(bot)
         assert bot.unpin_all_forum_topic_messages.call_count == _MAX_PROBE_FAILURES
-        assert _probe_failures["@5"] == _MAX_PROBE_FAILURES
+        assert _window_poll_state["@5"].probe_failures == _MAX_PROBE_FAILURES
 
     @pytest.mark.parametrize(
         "window_alive",
@@ -623,7 +652,7 @@ class TestProbeFailures:
         ],
     )
     async def test_topic_deleted_cleans_up(self, window_alive: bool) -> None:
-        _probe_failures["@5"] = 1
+        _get_window_state("@5").probe_failures = 1
         bot = AsyncMock()
         bot.unpin_all_forum_topic_messages.side_effect = BadRequest("Topic_id_invalid")
         mock_window = MagicMock()
@@ -649,7 +678,10 @@ class TestProbeFailures:
             mock_tm.kill_window.assert_not_called()
         mock_cleanup.assert_called_once_with(1, 42, bot, window_id="@5")
         mock_sm.unbind_thread.assert_called_once_with(1, 42)
-        assert "@5" not in _probe_failures
+        assert (
+            _window_poll_state.get("@5") is None
+            or _window_poll_state["@5"].probe_failures == 0
+        )
 
 
 class TestPruneStaleStatePolling:

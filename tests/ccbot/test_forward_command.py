@@ -196,11 +196,12 @@ class TestForwardCommandResolution:
 
     async def test_clear_enqueues_status_clear_and_resets_idle(self) -> None:
         from ccbot.handlers.status_polling import (
-            _has_seen_status,
+            _get_window_state,
+            _window_poll_state,
             reset_seen_status_state,
         )
 
-        _has_seen_status.add("@1")
+        _get_window_state("@1").has_seen_status = True
         try:
             with (
                 patch(
@@ -216,7 +217,10 @@ class TestForwardCommandResolution:
             assert call_args[0][2] == "@1"  # window_id
             assert call_args[0][3] is None  # status_text (clear)
             assert call_args[1]["thread_id"] == 42
-            assert "@1" not in _has_seen_status
+            assert not (
+                _window_poll_state.get("@1")
+                and _window_poll_state["@1"].has_seen_status
+            )
         finally:
             reset_seen_status_state()
 
