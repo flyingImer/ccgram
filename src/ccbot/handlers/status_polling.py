@@ -60,7 +60,11 @@ from .interactive_ui import (
     handle_interactive_ui,
 )
 from .cleanup import clear_topic_state
-from .message_queue import enqueue_status_update, get_message_queue
+from .message_queue import (
+    clear_tool_msg_ids_for_topic,
+    enqueue_status_update,
+    get_message_queue,
+)
 from .message_sender import rate_limit_send_message
 from .recovery_callbacks import build_recovery_keyboard
 from .topic_emoji import update_topic_emoji
@@ -768,7 +772,6 @@ async def _handle_dead_window_notification(
 
     # Clean up stale tool message IDs for this topic (window is dead,
     # no more tool_result edits will arrive).
-    from .message_queue import clear_tool_msg_ids_for_topic
 
     clear_tool_msg_ids_for_topic(user_id, thread_id)
     chat_id = session_manager.resolve_chat_id(user_id, thread_id)

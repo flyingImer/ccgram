@@ -91,15 +91,16 @@ async def _with_mdv2_fallback(
 
     Returns the result Message on success, None on failure.
     """
+    mdv2_text = convert_markdown(text)
+    plain_text = strip_mdv2(text)
+
     # Phase 1: try MarkdownV2
     try:
-        return await send_fn(convert_markdown(text), parse_mode="MarkdownV2", **kwargs)
+        return await send_fn(mdv2_text, parse_mode="MarkdownV2", **kwargs)
     except RetryAfter as e:
         await asyncio.sleep(_retry_after_seconds(e) + 1)
         try:
-            return await send_fn(
-                convert_markdown(text), parse_mode="MarkdownV2", **kwargs
-            )
+            return await send_fn(mdv2_text, parse_mode="MarkdownV2", **kwargs)
         except TelegramError as e2:
             logger.warning("Failed to %s after retry: %s", context_label, e2)
             return None
@@ -108,11 +109,11 @@ async def _with_mdv2_fallback(
 
     # Phase 2: fall back to plain text (stripped MarkdownV2 artifacts)
     try:
-        return await send_fn(strip_mdv2(text), **kwargs)
+        return await send_fn(plain_text, **kwargs)
     except RetryAfter as e:
         await asyncio.sleep(_retry_after_seconds(e) + 1)
         try:
-            return await send_fn(strip_mdv2(text), **kwargs)
+            return await send_fn(plain_text, **kwargs)
         except TelegramError as e2:
             logger.warning("Failed to %s after retry: %s", context_label, e2)
             return None
