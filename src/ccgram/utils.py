@@ -10,7 +10,10 @@ Provides:
   - log_throttled(): suppress repeated identical debug messages per key.
   - detect_tmux_context(): auto-detect tmux session name and own window ID.
   - check_duplicate_ccgram(): check if another ccgram is running in the session.
+  - handle_general_topic_message(): pin-once-then-react for General topic messages.
 """
+
+from __future__ import annotations
 
 import asyncio
 import contextlib
@@ -21,9 +24,13 @@ import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import structlog
+from telegram.error import TelegramError
+
+if TYPE_CHECKING:
+    from telegram import Bot, Message
 
 logger = structlog.get_logger()
 
@@ -343,3 +350,42 @@ def task_done_callback(task: asyncio.Task[None]) -> None:
     exc = task.exception()
     if exc is not None:
         logger.error("Background task %s failed", task.get_name(), exc_info=exc)
+
+
+# --- General topic pin-once-then-react ------------------------------------
+
+_general_topic_pin_cache: dict[int, bool] = {}
+
+
+async def handle_general_topic_message(
+    bot: Bot, message: Message, chat_id: int
+) -> None:
+    """Handle messages in General topic: pin hint once, then react only.
+
+    On first General-topic message per chat, sends a warning and pins it.
+    Subsequent messages get a silent 🤔 reaction instead.
+    """
+    # Check cache first to avoid unnecessary API calls
+    if not _general_topic_pin_cache.get(chat_id):
+        try:
+            chat_info = await bot.get_chat(chat_id)
+            pinned = chat_info.pinned_message
+            if pinned and pinned.from_user and pinned.from_user.is_bot:
+                _general_topic_pin_cache[chat_id] = True
+        except TelegramError:
+            pass
+
+    if _general_topic_pin_cache.get(chat_id):
+        # Already pinned — just react silently
+        with contextlib.suppress(TelegramError):
+            await message.set_reaction("🤔")
+    else:
+        # First time — send hint and pin it
+        try:
+            hint = await message.reply_text(
+                "🤖 Please use a named topic. Create a new topic to start a session."
+            )
+            await hint.pin(disable_notification=True)
+            _general_topic_pin_cache[chat_id] = True
+        except TelegramError:
+            pass
